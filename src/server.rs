@@ -345,8 +345,29 @@ mod tests {
                     .unwrap()
                     .to_str()
                     .unwrap(),
-                "Basic realm=\"main\""
+                "Basic realm=\"ihost\", charset=\"UTF-8\""
             );
+
+            for bad_credentials in [
+                "Basic dXNlcjp3cm9uZw==", // user:wrong
+                "Basic !!!not-base64!!!",
+                "Bearer abc",
+            ] {
+                let rejected = send(
+                    test_app(config.clone()),
+                    Request::builder()
+                        .uri("/secret.txt")
+                        .header(header::AUTHORIZATION, bad_credentials)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await;
+                assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+                assert!(
+                    rejected.headers().contains_key(header::WWW_AUTHENTICATE),
+                    "no re-prompt for {bad_credentials}"
+                );
+            }
 
             let authorized = send(
                 test_app(config),

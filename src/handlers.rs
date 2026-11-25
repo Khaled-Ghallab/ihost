@@ -346,46 +346,35 @@ fn authorize(config: &Config, headers: &HeaderMap) -> Result<Option<Response>, A
         return Ok(None);
     };
 
-    let Some(header_value) = headers.get(header::AUTHORIZATION) else {
-        let mut response = Response::new(Body::empty());
-        *response.status_mut() = StatusCode::UNAUTHORIZED;
-        response.headers_mut().insert(
-            header::WWW_AUTHENTICATE,
-            HeaderValue::from_static("Basic realm=\"main\""),
-        );
-        return Ok(Some(response));
-    };
+    let credentials = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Basic "))
+        .and_then(|encoded| BASE64_STANDARD.decode(encoded).ok())
+        .and_then(|decoded| String::from_utf8(decoded).ok())
+        .and_then(|decoded| parse_auth(&decoded).ok());
 
-    let Ok(header_value) = header_value.to_str() else {
-        return Ok(Some(text_response(
-            StatusCode::UNAUTHORIZED,
-            "Wrong username or password.",
-        )));
-    };
-
-    let Some(encoded) = header_value.strip_prefix("Basic ") else {
-        return Ok(Some(text_response(
-            StatusCode::UNAUTHORIZED,
-            "Wrong username or password.",
-        )));
-    };
-
-    let decoded = BASE64_STANDARD
-        .decode(encoded)
-        .map_err(|err| AppError::new(StatusCode::UNAUTHORIZED, err.to_string()))?;
-    let decoded = String::from_utf8(decoded)
-        .map_err(|err| AppError::new(StatusCode::UNAUTHORIZED, err.to_string()))?;
-
-    let parsed =
-        parse_auth(&decoded).map_err(|err| AppError::new(StatusCode::UNAUTHORIZED, err))?;
-    if parsed.username == auth.username && parsed.password == auth.password {
-        Ok(None)
-    } else {
-        Ok(Some(text_response(
-            StatusCode::UNAUTHORIZED,
-            "Wrong username or password.",
-        )))
+    match credentials {
+        Some(given) if given.username == auth.username && given.password == auth.password => {
+            Ok(None)
+        }
+        _ => Ok(Some(unauthorized_response())),
     }
+}
+
+/// Every rejected request carries `WWW-Authenticate`, so the browser asks for
+/// the username and password again. Without it, one typo leaves the browser
+/// resending the wrong credentials until it is restarted.
+fn unauthorized_response() -> Response {
+    let mut response = text_response(
+        StatusCode::UNAUTHORIZED,
+        "Username and password required. Reload the page to try again.",
+    );
+    response.headers_mut().insert(
+        header::WWW_AUTHENTICATE,
+        HeaderValue::from_static("Basic realm=\"ihost\", charset=\"UTF-8\""),
+    );
+    response
 }
 
 fn text_response(status: StatusCode, body: &str) -> Response {
