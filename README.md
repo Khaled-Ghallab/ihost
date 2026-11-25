@@ -1,5 +1,7 @@
 # ihost
 
+[العربية](README.ar.md)
+
 Share a folder over HTTP: on this machine, or with your phone and other devices on the same Wi-Fi. One command, nothing to install on the other device, only a browser.
 
 ```sh
