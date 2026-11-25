@@ -34,7 +34,7 @@ pub(crate) fn render(text: &str) -> Option<String> {
         .iter()
         .chain(&body)
         .chain(&blank)
-        .map(|line| format!("    {DARK_ON_LIGHT}{line}{RESET}"))
+        .map(|line| format!("{DARK_ON_LIGHT}{line}{RESET}"))
         .collect();
     Some(lines.join("\n"))
 }
@@ -53,7 +53,7 @@ mod tests {
         assert_eq!(lines.len(), 15);
         for line in &lines {
             let body = line
-                .strip_prefix(&format!("    {DARK_ON_LIGHT}"))
+                .strip_prefix(DARK_ON_LIGHT)
                 .and_then(|rest| rest.strip_suffix(RESET))
                 .unwrap();
             assert_eq!(body.chars().count(), 29);

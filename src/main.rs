@@ -1,3 +1,4 @@
+mod banner;
 mod config;
 mod handlers;
 mod qr;
@@ -6,7 +7,7 @@ mod util;
 
 use std::sync::Arc;
 
-use config::{bind_addr_string, build_cli, build_config, print_startup};
+use config::{bind_addr_string, build_cli, build_config};
 use server::run_server;
 
 fn main() {
@@ -20,7 +21,7 @@ fn main() {
     };
 
     if !config.silent {
-        print_startup(&config);
+        banner::print(&config);
     }
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()

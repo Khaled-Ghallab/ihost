@@ -1,6 +1,5 @@
 use std::{
-    env, fs,
-    io::{self, IsTerminal, Write},
+    env, fs, io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket},
     path::{Path, PathBuf},
     process::Command as ProcessCommand,
@@ -10,10 +9,7 @@ use std::{
 use axum::http::Uri;
 use clap::{Arg, ArgAction, Command};
 
-use crate::{
-    qr,
-    util::{generate_csrf_token, now_string, resolve_relative_path},
-};
+use crate::util::{generate_csrf_token, resolve_relative_path};
 
 #[derive(Clone)]
 pub(crate) struct Config {
@@ -69,6 +65,9 @@ Examples:
   ihost -H -a me:secret .                 Ask visitors for a username and password
   ihost -i --try-file dist/index.html dist
                                           Preview a built website (single-page app)";
+
+pub(crate) const DEFAULT_THREADS: usize = 3;
+const DEFAULT_THREADS_ARG: &str = "3";
 
 pub(crate) fn build_cli() -> Command {
     Command::new("ihost")
@@ -261,7 +260,7 @@ pub(crate) fn build_cli() -> Command {
                 .short('t')
                 .long("threads")
                 .value_name("NUM")
-                .default_value("3")
+                .default_value(DEFAULT_THREADS_ARG)
                 .value_parser(clap::builder::ValueParser::new(parse_threads))
                 .help_heading(HEADING_PERFORMANCE)
                 .help("Number of worker threads"),
@@ -387,97 +386,6 @@ pub(crate) fn parse_auth(value: &str) -> Result<AuthConfig, String> {
     }
 }
 
-pub(crate) fn print_startup(config: &Config) {
-    let detected_network_ip = detect_network_ip(config.ip);
-    let compression = if config.compress.is_empty() {
-        "disabled".to_owned()
-    } else {
-        format!(
-            "{:?}",
-            config
-                .compress
-                .iter()
-                .map(|value| format!("*{value}"))
-                .collect::<Vec<_>>()
-        )
-    };
-
-    println!(
-        "     Index: {}, Cache: {}, Cors: {}, Coop: {}, Coep: {}, Range: {}, Sort: {}, Threads: {}\n      Upload: {}, CSRF Token: {}\n        Auth: {}\n Compression: {}\n       HTTPS: {}, Cert: {}, Cert-Password: {}\n        Root: {}\n     BaseURL: {}\n  TryFile404: {}\n{}",
-        enable_string(config.index),
-        enable_string(config.cache),
-        enable_string(config.cors),
-        enable_string(config.coop),
-        enable_string(config.coep),
-        enable_string(config.range),
-        enable_string(config.sort),
-        config.threads,
-        enable_string(config.upload.is_some()),
-        config
-            .upload
-            .as_ref()
-            .map(|upload| upload.csrf_token.as_str())
-            .unwrap_or(""),
-        enable_string(config.auth.is_some()),
-        compression,
-        enable_string(config.cert.is_some()),
-        config
-            .cert
-            .as_ref()
-            .map(|path| path.to_string_lossy().into_owned())
-            .unwrap_or_default(),
-        enable_string(config.certpass.is_some()),
-        config.root.to_string_lossy(),
-        config.base_url,
-        config
-            .try_file_404
-            .as_ref()
-            .map(|path| path.to_string_lossy().into_owned())
-            .unwrap_or_default(),
-        address_lines(config, detected_network_ip),
-    );
-
-    if let Some(drawing) = startup_qr_url(config, detected_network_ip, io::stdout().is_terminal())
-        .as_deref()
-        .and_then(qr::render)
-    {
-        // anstream keeps the colors working on legacy Windows consoles.
-        let _ = writeln!(anstream::stdout(), "\n{drawing}\n");
-    }
-
-    println!("========== [{}] ==========", now_string());
-}
-
-/// The network URL to show as a QR code, if a phone could open it: only when
-/// the server is reachable from the network and stdout is an interactive terminal.
-fn startup_qr_url(
-    config: &Config,
-    detected_network_ip: Option<IpAddr>,
-    stdout_is_terminal: bool,
-) -> Option<String> {
-    if !stdout_is_terminal {
-        return None;
-    }
-    network_url(config, detected_network_ip)
-}
-
-/// Renders the "Local" / "Network" lines of the startup banner.
-fn address_lines(config: &Config, detected_network_ip: Option<IpAddr>) -> String {
-    let mut lines = Vec::new();
-    if let Some(url) = local_url(config) {
-        lines.push(format!("       Local: {url}"));
-    }
-
-    let network = if config.ip.is_loopback() {
-        "use -H to expose".to_owned()
-    } else {
-        network_url(config, detected_network_ip).unwrap_or_else(|| "not detected".to_owned())
-    };
-    lines.push(format!("     Network: {network}"));
-
-    lines.join("\n")
-}
-
 pub(crate) fn bind_addr_string(ip: IpAddr, port: u16) -> String {
     if ip.is_ipv4() {
         format!("{ip}:{port}")
@@ -543,7 +451,7 @@ pub(crate) fn network_url(config: &Config, detected_network_ip: Option<IpAddr>) 
 ///
 /// Connecting a UDP socket sends no packets; it only asks the OS which local
 /// interface would route to the probe (a reserved documentation address).
-fn detect_network_ip(bind_ip: IpAddr) -> Option<IpAddr> {
+pub(crate) fn detect_network_ip(bind_ip: IpAddr) -> Option<IpAddr> {
     if !bind_ip.is_unspecified() {
         return None;
     }
@@ -567,10 +475,6 @@ fn detect_network_ip(bind_ip: IpAddr) -> Option<IpAddr> {
 
 pub(crate) fn browser_url(config: &Config) -> String {
     local_url(config).unwrap_or_else(|| server_url(config))
-}
-
-pub(crate) fn enable_string(value: bool) -> &'static str {
-    if value { "enabled" } else { "disabled" }
 }
 
 fn parse_existing_dir(value: &str) -> Result<PathBuf, String> {
@@ -728,6 +632,34 @@ fn command_status(command: &mut ProcessCommand) -> io::Result<()> {
 }
 
 #[cfg(test)]
+pub(crate) fn test_config(ip: IpAddr) -> Config {
+    Config {
+        root: PathBuf::from("."),
+        index: false,
+        upload: None,
+        redirect_to: None,
+        sort: true,
+        cache: true,
+        range: true,
+        cert: None,
+        certpass: None,
+        cors: false,
+        coop: false,
+        coep: false,
+        ip,
+        port: 8000,
+        upload_size_limit: 8 * 1024 * 1024,
+        auth: None,
+        compress: Vec::new(),
+        threads: DEFAULT_THREADS,
+        try_file_404: None,
+        silent: false,
+        open: false,
+        base_url: "/".to_owned(),
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr};
 
@@ -835,29 +767,6 @@ mod tests {
     }
 
     #[test]
-    fn loopback_bind_shows_local_url_and_expose_hint() {
-        let config = test_config(IpAddr::V4(Ipv4Addr::LOCALHOST));
-        assert_eq!(
-            address_lines(&config, None),
-            "       Local: http://127.0.0.1:8000\n     Network: use -H to expose"
-        );
-    }
-
-    #[test]
-    fn wildcard_bind_shows_local_and_network_urls() {
-        let config = test_config(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
-        let lan = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 23));
-        assert_eq!(
-            address_lines(&config, Some(lan)),
-            "       Local: http://127.0.0.1:8000\n     Network: http://192.168.1.23:8000"
-        );
-        assert_eq!(
-            address_lines(&config, None),
-            "       Local: http://127.0.0.1:8000\n     Network: not detected"
-        );
-    }
-
-    #[test]
     fn ipv6_wildcard_bind_uses_ipv6_urls() {
         let config = test_config(IpAddr::V6(Ipv6Addr::UNSPECIFIED));
         let lan = IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 7));
@@ -869,11 +778,31 @@ mod tests {
     }
 
     #[test]
-    fn specific_bind_shows_only_that_address() {
-        let config = test_config(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)));
+    fn loopback_bind_has_local_url_only() {
+        let config = test_config(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!(local_url(&config).as_deref(), Some("http://127.0.0.1:8000"));
+        assert_eq!(network_url(&config, None), None);
+    }
+
+    #[test]
+    fn wildcard_bind_has_local_and_detected_network_url() {
+        let config = test_config(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        let lan = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 23));
+        assert_eq!(local_url(&config).as_deref(), Some("http://127.0.0.1:8000"));
         assert_eq!(
-            address_lines(&config, None),
-            "     Network: http://10.0.0.5:8000"
+            network_url(&config, Some(lan)).as_deref(),
+            Some("http://192.168.1.23:8000")
+        );
+        assert_eq!(network_url(&config, None), None);
+    }
+
+    #[test]
+    fn specific_bind_has_network_url_only() {
+        let config = test_config(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)));
+        assert_eq!(local_url(&config), None);
+        assert_eq!(
+            network_url(&config, None).as_deref(),
+            Some("http://10.0.0.5:8000")
         );
     }
 
@@ -883,24 +812,19 @@ mod tests {
         config.cert = Some(PathBuf::from("localhost.p12"));
         let lan = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 23));
         assert_eq!(
-            address_lines(&config, Some(lan)),
-            "       Local: https://localhost:8000\n     Network: https://192.168.1.23:8000"
+            local_url(&config).as_deref(),
+            Some("https://localhost:8000")
+        );
+        assert_eq!(
+            network_url(&config, Some(lan)).as_deref(),
+            Some("https://192.168.1.23:8000")
         );
     }
 
     #[test]
-    fn qr_code_only_for_network_urls_on_a_terminal() {
-        let lan = Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 23)));
-        let exposed = test_config(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
-        let local = test_config(IpAddr::V4(Ipv4Addr::LOCALHOST));
-
-        assert_eq!(
-            startup_qr_url(&exposed, lan, true).as_deref(),
-            Some("http://192.168.1.23:8000")
-        );
-        assert_eq!(startup_qr_url(&exposed, lan, false), None);
-        assert_eq!(startup_qr_url(&exposed, None, true), None);
-        assert_eq!(startup_qr_url(&local, lan, true), None);
+    fn default_threads_matches_cli_default() {
+        let config = build_config(build_cli().get_matches_from(["ihost"])).unwrap();
+        assert_eq!(config.threads, DEFAULT_THREADS);
     }
 
     #[test]
@@ -927,32 +851,5 @@ mod tests {
         ));
         fs::create_dir_all(&path).unwrap();
         path
-    }
-
-    fn test_config(ip: IpAddr) -> Config {
-        Config {
-            root: PathBuf::from("."),
-            index: false,
-            upload: None,
-            redirect_to: None,
-            sort: true,
-            cache: true,
-            range: true,
-            cert: None,
-            certpass: None,
-            cors: false,
-            coop: false,
-            coep: false,
-            ip,
-            port: 8000,
-            upload_size_limit: 8 * 1024 * 1024,
-            auth: None,
-            compress: Vec::new(),
-            threads: 1,
-            try_file_404: None,
-            silent: false,
-            open: false,
-            base_url: "/".to_owned(),
-        }
     }
 }
