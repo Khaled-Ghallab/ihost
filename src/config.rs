@@ -1,5 +1,6 @@
 use std::{
-    env, fs, io,
+    env, fs,
+    io::{self, IsTerminal, Write},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket},
     path::{Path, PathBuf},
     process::Command as ProcessCommand,
@@ -9,7 +10,10 @@ use std::{
 use axum::http::Uri;
 use clap::{Arg, ArgAction, Command};
 
-use crate::util::{generate_csrf_token, now_string, resolve_relative_path};
+use crate::{
+    qr,
+    util::{generate_csrf_token, now_string, resolve_relative_path},
+};
 
 #[derive(Clone)]
 pub(crate) struct Config {
@@ -88,7 +92,7 @@ pub(crate) fn build_cli() -> Command {
                 .action(ArgAction::SetTrue)
                 .conflicts_with("ip")
                 .help_heading(HEADING_NETWORK)
-                .help("Share with other devices on the network (binds 0.0.0.0 and prints the network URL)"),
+                .help("Share with other devices on the network (binds 0.0.0.0, prints the network URL and a QR code)"),
         )
         .arg(
             Arg::new("port")
@@ -384,6 +388,7 @@ pub(crate) fn parse_auth(value: &str) -> Result<AuthConfig, String> {
 }
 
 pub(crate) fn print_startup(config: &Config) {
+    let detected_network_ip = detect_network_ip(config.ip);
     let compression = if config.compress.is_empty() {
         "disabled".to_owned()
     } else {
@@ -398,7 +403,7 @@ pub(crate) fn print_startup(config: &Config) {
     };
 
     println!(
-        "     Index: {}, Cache: {}, Cors: {}, Coop: {}, Coep: {}, Range: {}, Sort: {}, Threads: {}\n      Upload: {}, CSRF Token: {}\n        Auth: {}\n Compression: {}\n       HTTPS: {}, Cert: {}, Cert-Password: {}\n        Root: {}\n     BaseURL: {}\n  TryFile404: {}\n{}\n========== [{}] ==========",
+        "     Index: {}, Cache: {}, Cors: {}, Coop: {}, Coep: {}, Range: {}, Sort: {}, Threads: {}\n      Upload: {}, CSRF Token: {}\n        Auth: {}\n Compression: {}\n       HTTPS: {}, Cert: {}, Cert-Password: {}\n        Root: {}\n     BaseURL: {}\n  TryFile404: {}\n{}",
         enable_string(config.index),
         enable_string(config.cache),
         enable_string(config.cors),
@@ -429,9 +434,31 @@ pub(crate) fn print_startup(config: &Config) {
             .as_ref()
             .map(|path| path.to_string_lossy().into_owned())
             .unwrap_or_default(),
-        address_lines(config, detect_network_ip(config.ip)),
-        now_string()
+        address_lines(config, detected_network_ip),
     );
+
+    if let Some(drawing) = startup_qr_url(config, detected_network_ip, io::stdout().is_terminal())
+        .as_deref()
+        .and_then(qr::render)
+    {
+        // anstream keeps the colors working on legacy Windows consoles.
+        let _ = writeln!(anstream::stdout(), "\n{drawing}\n");
+    }
+
+    println!("========== [{}] ==========", now_string());
+}
+
+/// The network URL to show as a QR code, if a phone could open it: only when
+/// the server is reachable from the network and stdout is an interactive terminal.
+fn startup_qr_url(
+    config: &Config,
+    detected_network_ip: Option<IpAddr>,
+    stdout_is_terminal: bool,
+) -> Option<String> {
+    if !stdout_is_terminal {
+        return None;
+    }
+    network_url(config, detected_network_ip)
 }
 
 /// Renders the "Local" / "Network" lines of the startup banner.
@@ -859,6 +886,21 @@ mod tests {
             address_lines(&config, Some(lan)),
             "       Local: https://localhost:8000\n     Network: https://192.168.1.23:8000"
         );
+    }
+
+    #[test]
+    fn qr_code_only_for_network_urls_on_a_terminal() {
+        let lan = Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 23)));
+        let exposed = test_config(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        let local = test_config(IpAddr::V4(Ipv4Addr::LOCALHOST));
+
+        assert_eq!(
+            startup_qr_url(&exposed, lan, true).as_deref(),
+            Some("http://192.168.1.23:8000")
+        );
+        assert_eq!(startup_qr_url(&exposed, lan, false), None);
+        assert_eq!(startup_qr_url(&exposed, None, true), None);
+        assert_eq!(startup_qr_url(&local, lan, true), None);
     }
 
     #[test]

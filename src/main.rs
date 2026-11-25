@@ -1,5 +1,6 @@
 mod config;
 mod handlers;
+mod qr;
 mod server;
 mod util;
 
