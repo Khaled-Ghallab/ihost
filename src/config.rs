@@ -1,0 +1,916 @@
+use std::{
+    env, fs, io,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket},
+    path::{Path, PathBuf},
+    process::Command as ProcessCommand,
+    str::FromStr,
+};
+
+use axum::http::Uri;
+use clap::{Arg, ArgAction, Command};
+
+use crate::util::{generate_csrf_token, now_string, resolve_relative_path};
+
+#[derive(Clone)]
+pub(crate) struct Config {
+    pub(crate) root: PathBuf,
+    pub(crate) index: bool,
+    pub(crate) upload: Option<UploadConfig>,
+    pub(crate) redirect_to: Option<String>,
+    pub(crate) sort: bool,
+    pub(crate) cache: bool,
+    pub(crate) range: bool,
+    pub(crate) cert: Option<PathBuf>,
+    pub(crate) certpass: Option<String>,
+    pub(crate) cors: bool,
+    pub(crate) coop: bool,
+    pub(crate) coep: bool,
+    pub(crate) ip: IpAddr,
+    pub(crate) port: u16,
+    pub(crate) upload_size_limit: u64,
+    pub(crate) auth: Option<AuthConfig>,
+    pub(crate) compress: Vec<String>,
+    pub(crate) threads: usize,
+    pub(crate) try_file_404: Option<PathBuf>,
+    pub(crate) silent: bool,
+    pub(crate) open: bool,
+    pub(crate) base_url: String,
+}
+
+#[derive(Clone)]
+pub(crate) struct UploadConfig {
+    pub(crate) csrf_token: String,
+}
+
+#[derive(Clone)]
+pub(crate) struct AuthConfig {
+    pub(crate) username: String,
+    pub(crate) password: String,
+}
+
+const HEADING_NETWORK: &str = "Network";
+const HEADING_FILES: &str = "Files";
+const HEADING_UPLOADS: &str = "Uploads";
+const HEADING_SECURITY: &str = "Security";
+const HEADING_HTTPS: &str = "HTTPS (requires the tls build feature)";
+const HEADING_HEADERS: &str = "Response headers";
+const HEADING_PERFORMANCE: &str = "Performance";
+const HEADING_OUTPUT: &str = "Output";
+
+const AFTER_HELP: &str = "\
+Examples:
+  ihost                                   Serve the current folder on this machine
+  ihost -H ~/Photos                       Share a folder with your phone (same Wi-Fi)
+  ihost -H -u .                           ...and let other devices upload files to it
+  ihost -H -a me:secret .                 Ask visitors for a username and password
+  ihost -i --try-file dist/index.html dist
+                                          Preview a built website (single-page app)";
+
+pub(crate) fn build_cli() -> Command {
+    Command::new("ihost")
+        .display_name("ihost")
+        .bin_name("ihost")
+        .version(env!("CARGO_PKG_VERSION"))
+        .about("Share a folder over HTTP: on this machine, or with your phone and other devices on the same network.")
+        .after_help(AFTER_HELP)
+        .arg(
+            Arg::new("root")
+                .index(1)
+                .value_name("FOLDER")
+                .value_parser(clap::builder::ValueParser::new(parse_existing_dir))
+                .help("Folder to serve [default: current folder]"),
+        )
+        // Network
+        .arg(
+            Arg::new("host")
+                .short('H')
+                .long("host")
+                .action(ArgAction::SetTrue)
+                .conflicts_with("ip")
+                .help_heading(HEADING_NETWORK)
+                .help("Share with other devices on the network (binds 0.0.0.0 and prints the network URL)"),
+        )
+        .arg(
+            Arg::new("port")
+                .short('p')
+                .long("port")
+                .value_name("PORT")
+                .default_value("8000")
+                .value_parser(clap::builder::ValueParser::new(parse_port))
+                .help_heading(HEADING_NETWORK)
+                .help("Port to listen on"),
+        )
+        .arg(
+            Arg::new("ip")
+                .long("ip")
+                .value_name("IP")
+                .default_value("127.0.0.1")
+                .value_parser(clap::builder::ValueParser::new(parse_ip_addr))
+                .help_heading(HEADING_NETWORK)
+                .help("Bind to a specific IP address instead"),
+        )
+        // Files
+        .arg(
+            Arg::new("index")
+                .short('i')
+                .long("index")
+                .action(ArgAction::SetTrue)
+                .help_heading(HEADING_FILES)
+                .help("Show index.html / index.htm instead of the folder listing when present"),
+        )
+        .arg(
+            Arg::new("try-file-404")
+                .long("try-file")
+                .visible_alias("try-file-404")
+                .value_name("PATH")
+                .value_parser(clap::builder::ValueParser::new(parse_try_file_arg))
+                .help_heading(HEADING_FILES)
+                .help("Serve this file for missing paths, e.g. a single-page app's index.html. Relative paths are resolved against the served folder"),
+        )
+        .arg(
+            Arg::new("nosort")
+                .long("nosort")
+                .action(ArgAction::SetTrue)
+                .help_heading(HEADING_FILES)
+                .help("Disable sorting of folder listings (by name, modified, size)"),
+        )
+        .arg(
+            Arg::new("base-url")
+                .short('b')
+                .long("base-url")
+                .value_name("PATH")
+                .default_value("/")
+                .help_heading(HEADING_FILES)
+                .help("URL prefix used in listings and upload redirects, for running behind a reverse proxy"),
+        )
+        .arg(
+            Arg::new("redirect")
+                .long("redirect")
+                .value_name("URL")
+                .value_parser(clap::builder::ValueParser::new(parse_redirect_url))
+                .help_heading(HEADING_FILES)
+                .help("Redirect every request to this URL (HTTP 301)"),
+        )
+        // Uploads
+        .arg(
+            Arg::new("upload")
+                .short('u')
+                .long("upload")
+                .action(ArgAction::SetTrue)
+                .help_heading(HEADING_UPLOADS)
+                .help("Allow uploading files from the browser (several at once, CSRF-protected)"),
+        )
+        .arg(
+            Arg::new("upload_size_limit")
+                .short('l')
+                .long("upload-size-limit")
+                .value_name("SIZE")
+                .default_value("8M")
+                .value_parser(clap::builder::ValueParser::new(parse_upload_size_limit))
+                .help_heading(HEADING_UPLOADS)
+                .help("Maximum upload size, in bytes or with a K/M/G/T suffix (powers of 1024), e.g. 30K, 50M, 1G"),
+        )
+        .arg(
+            Arg::new("csrf")
+                .long("csrf")
+                .value_name("TOKEN")
+                .value_parser(clap::builder::NonEmptyStringValueParser::new())
+                .help_heading(HEADING_UPLOADS)
+                .help("Use a fixed CSRF token instead of a random one. Unsafe: the token shows up in process listings and shell history"),
+        )
+        // Security
+        .arg(
+            Arg::new("auth")
+                .short('a')
+                .long("auth")
+                .value_name("USER:PASS")
+                .value_parser(clap::builder::ValueParser::new(parse_auth_arg))
+                .help_heading(HEADING_SECURITY)
+                .help("Require a username and password (HTTP Basic Auth)"),
+        )
+        // HTTPS
+        .arg(
+            Arg::new("cert")
+                .long("cert")
+                .value_name("FILE")
+                .value_parser(clap::builder::ValueParser::new(parse_existing_file))
+                .help_heading(HEADING_HTTPS)
+                .help("Serve over HTTPS with this certificate (PKCS#12 / .p12)"),
+        )
+        .arg(
+            Arg::new("certpass")
+                .long("certpass")
+                .value_name("PASSWORD")
+                .help_heading(HEADING_HTTPS)
+                .help("Password for the certificate file"),
+        )
+        // Response headers
+        .arg(
+            Arg::new("cors")
+                .long("cors")
+                .action(ArgAction::SetTrue)
+                .help_heading(HEADING_HEADERS)
+                .help("Allow requests from other origins (Access-Control-Allow-Origin: *)"),
+        )
+        .arg(
+            Arg::new("coop")
+                .long("coop")
+                .action(ArgAction::SetTrue)
+                .help_heading(HEADING_HEADERS)
+                .help("Send Cross-Origin-Opener-Policy: same-origin"),
+        )
+        .arg(
+            Arg::new("coep")
+                .long("coep")
+                .action(ArgAction::SetTrue)
+                .help_heading(HEADING_HEADERS)
+                .help("Send Cross-Origin-Embedder-Policy: require-corp"),
+        )
+        // Performance
+        .arg(
+            Arg::new("compress")
+                .short('c')
+                .long("compress")
+                .value_name("EXT")
+                .action(ArgAction::Append)
+                .value_delimiter(',')
+                .num_args(1..)
+                .help_heading(HEADING_PERFORMANCE)
+                .help("Compress files with these extensions (gzip/deflate), e.g. -c=js,d.ts. Skipped for partial (range) requests"),
+        )
+        .arg(
+            Arg::new("nocache")
+                .long("nocache")
+                .action(ArgAction::SetTrue)
+                .help_heading(HEADING_PERFORMANCE)
+                .help("Disable HTTP caching"),
+        )
+        .arg(
+            Arg::new("norange")
+                .long("norange")
+                .action(ArgAction::SetTrue)
+                .help_heading(HEADING_PERFORMANCE)
+                .help("Disable partial downloads (Range requests), which resume and video seeking rely on"),
+        )
+        .arg(
+            Arg::new("threads")
+                .short('t')
+                .long("threads")
+                .value_name("NUM")
+                .default_value("3")
+                .value_parser(clap::builder::ValueParser::new(parse_threads))
+                .help_heading(HEADING_PERFORMANCE)
+                .help("Number of worker threads"),
+        )
+        // Output
+        .arg(
+            Arg::new("open")
+                .short('o')
+                .long("open")
+                .action(ArgAction::SetTrue)
+                .help_heading(HEADING_OUTPUT)
+                .help("Open the page in the default browser"),
+        )
+        .arg(
+            Arg::new("silent")
+                .short('s')
+                .long("silent")
+                .action(ArgAction::SetTrue)
+                .help_heading(HEADING_OUTPUT)
+                .help("Print nothing"),
+        )
+}
+
+pub(crate) fn build_config(matches: clap::ArgMatches) -> Result<Config, String> {
+    let root = matches
+        .get_one::<PathBuf>("root")
+        .cloned()
+        .map(|path| fs::canonicalize(path).map_err(|err| err.to_string()))
+        .transpose()?
+        .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+
+    let upload = if matches.get_flag("upload") {
+        let csrf_token = if let Some(custom_token) = matches.get_one::<String>("csrf") {
+            if !matches.get_flag("silent") {
+                eprintln!(
+                    "WARNING: Using a custom CSRF token is dangerous. The token is visible in process listings and shell history. Consider using the auto-generated token instead."
+                );
+            }
+            custom_token.clone()
+        } else {
+            generate_csrf_token()?
+        };
+
+        Some(UploadConfig { csrf_token })
+    } else {
+        None
+    };
+
+    let auth = matches
+        .get_one::<String>("auth")
+        .map(|value| parse_auth(value))
+        .transpose()?;
+
+    let compress = matches
+        .get_many::<String>("compress")
+        .map(|values| values.map(|value| format!(".{value}")).collect())
+        .unwrap_or_default();
+
+    let try_file_404 = matches
+        .get_one::<PathBuf>("try-file-404")
+        .map(|path| resolve_try_file_path(&root, path))
+        .transpose()?;
+
+    let base_url = normalize_base_url(
+        matches
+            .get_one::<String>("base-url")
+            .map(String::as_str)
+            .unwrap_or("/"),
+    )?;
+
+    Ok(Config {
+        root,
+        index: matches.get_flag("index"),
+        upload,
+        redirect_to: matches.get_one::<String>("redirect").cloned(),
+        sort: !matches.get_flag("nosort"),
+        cache: !matches.get_flag("nocache"),
+        range: !matches.get_flag("norange"),
+        cert: matches.get_one::<PathBuf>("cert").cloned(),
+        certpass: matches.get_one::<String>("certpass").cloned(),
+        cors: matches.get_flag("cors"),
+        coop: matches.get_flag("coop"),
+        coep: matches.get_flag("coep"),
+        ip: if matches.get_flag("host") {
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+        } else {
+            *matches
+                .get_one::<IpAddr>("ip")
+                .ok_or_else(|| "missing --ip".to_owned())?
+        },
+        port: *matches
+            .get_one::<u16>("port")
+            .ok_or_else(|| "missing --port".to_owned())?,
+        upload_size_limit: *matches
+            .get_one::<u64>("upload_size_limit")
+            .ok_or_else(|| "missing --upload-size-limit".to_owned())?,
+        auth,
+        compress,
+        threads: *matches
+            .get_one::<usize>("threads")
+            .ok_or_else(|| "missing --threads".to_owned())?,
+        try_file_404,
+        silent: matches.get_flag("silent"),
+        open: matches.get_flag("open"),
+        base_url,
+    })
+}
+
+pub(crate) fn parse_auth(value: &str) -> Result<AuthConfig, String> {
+    let mut parts = value.splitn(2, ':');
+    let username = parts.next().unwrap_or_default();
+    let password = parts.next().unwrap_or_default();
+
+    if username.is_empty() {
+        Err("no username found".to_owned())
+    } else if password.is_empty() {
+        Err("no password found".to_owned())
+    } else {
+        Ok(AuthConfig {
+            username: username.to_owned(),
+            password: password.to_owned(),
+        })
+    }
+}
+
+pub(crate) fn print_startup(config: &Config) {
+    let compression = if config.compress.is_empty() {
+        "disabled".to_owned()
+    } else {
+        format!(
+            "{:?}",
+            config
+                .compress
+                .iter()
+                .map(|value| format!("*{value}"))
+                .collect::<Vec<_>>()
+        )
+    };
+
+    println!(
+        "     Index: {}, Cache: {}, Cors: {}, Coop: {}, Coep: {}, Range: {}, Sort: {}, Threads: {}\n      Upload: {}, CSRF Token: {}\n        Auth: {}\n Compression: {}\n       HTTPS: {}, Cert: {}, Cert-Password: {}\n        Root: {}\n     BaseURL: {}\n  TryFile404: {}\n{}\n========== [{}] ==========",
+        enable_string(config.index),
+        enable_string(config.cache),
+        enable_string(config.cors),
+        enable_string(config.coop),
+        enable_string(config.coep),
+        enable_string(config.range),
+        enable_string(config.sort),
+        config.threads,
+        enable_string(config.upload.is_some()),
+        config
+            .upload
+            .as_ref()
+            .map(|upload| upload.csrf_token.as_str())
+            .unwrap_or(""),
+        enable_string(config.auth.is_some()),
+        compression,
+        enable_string(config.cert.is_some()),
+        config
+            .cert
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        enable_string(config.certpass.is_some()),
+        config.root.to_string_lossy(),
+        config.base_url,
+        config
+            .try_file_404
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        address_lines(config, detect_network_ip(config.ip)),
+        now_string()
+    );
+}
+
+/// Renders the "Local" / "Network" lines of the startup banner.
+fn address_lines(config: &Config, detected_network_ip: Option<IpAddr>) -> String {
+    let mut lines = Vec::new();
+    if let Some(url) = local_url(config) {
+        lines.push(format!("       Local: {url}"));
+    }
+
+    let network = if config.ip.is_loopback() {
+        "use -H to expose".to_owned()
+    } else {
+        network_url(config, detected_network_ip).unwrap_or_else(|| "not detected".to_owned())
+    };
+    lines.push(format!("     Network: {network}"));
+
+    lines.join("\n")
+}
+
+pub(crate) fn bind_addr_string(ip: IpAddr, port: u16) -> String {
+    if ip.is_ipv4() {
+        format!("{ip}:{port}")
+    } else {
+        format!("[{ip}]:{port}")
+    }
+}
+
+pub(crate) fn server_url(config: &Config) -> String {
+    let scheme = if config.cert.is_some() {
+        "https"
+    } else {
+        "http"
+    };
+    format!("{scheme}://{}", bind_addr_string(config.ip, config.port))
+}
+
+/// URL for reaching the server from this machine, when the bind address allows it.
+/// HTTPS uses `localhost` because local certificates are usually issued for that name.
+pub(crate) fn local_url(config: &Config) -> Option<String> {
+    let ip = config.ip;
+    if !(ip.is_unspecified() || ip.is_loopback()) {
+        return None;
+    }
+
+    if config.cert.is_some() {
+        return Some(format!("https://localhost:{}", config.port));
+    }
+
+    let host = match ip {
+        _ if ip.is_loopback() => ip,
+        IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::LOCALHOST),
+    };
+    Some(format!("http://{}", bind_addr_string(host, config.port)))
+}
+
+/// URL for reaching the server from other devices on the network.
+/// A wildcard bind needs the detected address of this machine to build one.
+pub(crate) fn network_url(config: &Config, detected_network_ip: Option<IpAddr>) -> Option<String> {
+    let ip = config.ip;
+    if ip.is_loopback() {
+        return None;
+    }
+
+    let host = if ip.is_unspecified() {
+        detected_network_ip?
+    } else {
+        ip
+    };
+    let scheme = if config.cert.is_some() {
+        "https"
+    } else {
+        "http"
+    };
+    Some(format!(
+        "{scheme}://{}",
+        bind_addr_string(host, config.port)
+    ))
+}
+
+/// Finds the address this machine uses on its network, for wildcard binds only.
+///
+/// Connecting a UDP socket sends no packets; it only asks the OS which local
+/// interface would route to the probe (a reserved documentation address).
+fn detect_network_ip(bind_ip: IpAddr) -> Option<IpAddr> {
+    if !bind_ip.is_unspecified() {
+        return None;
+    }
+
+    let (local, probe): (SocketAddr, SocketAddr) = match bind_ip {
+        IpAddr::V4(_) => (
+            (Ipv4Addr::UNSPECIFIED, 0).into(),
+            (Ipv4Addr::new(192, 0, 2, 1), 9).into(),
+        ),
+        IpAddr::V6(_) => (
+            (Ipv6Addr::UNSPECIFIED, 0).into(),
+            (Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1), 9).into(),
+        ),
+    };
+
+    let socket = UdpSocket::bind(local).ok()?;
+    socket.connect(probe).ok()?;
+    let ip = socket.local_addr().ok()?.ip();
+    (!ip.is_unspecified() && !ip.is_loopback()).then_some(ip)
+}
+
+pub(crate) fn browser_url(config: &Config) -> String {
+    local_url(config).unwrap_or_else(|| server_url(config))
+}
+
+pub(crate) fn enable_string(value: bool) -> &'static str {
+    if value { "enabled" } else { "disabled" }
+}
+
+fn parse_existing_dir(value: &str) -> Result<PathBuf, String> {
+    match fs::metadata(value) {
+        Ok(metadata) if metadata.is_dir() => Ok(PathBuf::from(value)),
+        Ok(_) => Err("Not directory".to_owned()),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+fn parse_existing_file(value: &str) -> Result<PathBuf, String> {
+    match fs::metadata(value) {
+        Ok(metadata) if metadata.is_file() => Ok(PathBuf::from(value)),
+        Ok(_) => Err("Not a regular file".to_owned()),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+fn parse_try_file_arg(value: &str) -> Result<PathBuf, String> {
+    if value.is_empty() {
+        Err("Path can not be empty".to_owned())
+    } else {
+        Ok(PathBuf::from(value))
+    }
+}
+
+pub(crate) fn normalize_base_url(value: &str) -> Result<String, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err("base-url can not be empty".to_owned());
+    }
+
+    let mut normalized = if trimmed.starts_with('/') {
+        trimmed.to_owned()
+    } else {
+        format!("/{trimmed}")
+    };
+
+    if normalized != "/" && !normalized.ends_with('/') {
+        normalized.push('/');
+    }
+
+    Ok(normalized)
+}
+
+pub(crate) fn resolve_try_file_path(root: &Path, path: &Path) -> Result<PathBuf, String> {
+    let resolved = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        resolve_relative_path(root, path)?
+    };
+
+    match fs::metadata(&resolved) {
+        Ok(metadata) if metadata.is_file() => {
+            fs::canonicalize(&resolved).map_err(|err| err.to_string())
+        }
+        Ok(_) => Err("Not a file".to_owned()),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+fn parse_redirect_url(value: &str) -> Result<String, String> {
+    let uri = Uri::from_str(value).map_err(|err| err.to_string())?;
+    if uri.scheme_str().is_some() && uri.authority().is_some() {
+        Ok(value.to_owned())
+    } else {
+        Err("URL must be absolute".to_owned())
+    }
+}
+
+fn parse_ip_addr(value: &str) -> Result<IpAddr, String> {
+    IpAddr::from_str(value).map_err(|err| err.to_string())
+}
+
+fn parse_port(value: &str) -> Result<u16, String> {
+    value.parse::<u16>().map_err(|err| err.to_string())
+}
+
+fn parse_threads(value: &str) -> Result<usize, String> {
+    match value.parse::<u8>() {
+        Ok(0) => Err("Not positive number".to_owned()),
+        Ok(value) => Ok(value as usize),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+fn parse_upload_size_limit(value: &str) -> Result<u64, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err("size limit can not be empty".to_owned());
+    }
+
+    let suffix_start = trimmed
+        .find(|ch: char| !ch.is_ascii_digit())
+        .unwrap_or(trimmed.len());
+    let (number, suffix) = trimmed.split_at(suffix_start);
+
+    if number.is_empty() {
+        return Err("size limit must start with a number".to_owned());
+    }
+
+    let value = number.parse::<u64>().map_err(|err| err.to_string())?;
+    let multiplier = match suffix.trim().to_ascii_uppercase().as_str() {
+        "" | "B" => 1,
+        "K" | "KB" => 1024,
+        "M" | "MB" => 1024_u64.pow(2),
+        "G" | "GB" => 1024_u64.pow(3),
+        "T" | "TB" => 1024_u64.pow(4),
+        _ => {
+            return Err(
+                "unsupported size suffix, use bytes or K/M/G/T suffixes with powers of 1024, for example 30K, 50M, 1G"
+                    .to_owned(),
+            );
+        }
+    };
+
+    value
+        .checked_mul(multiplier)
+        .ok_or_else(|| "size limit is too large".to_owned())
+}
+
+fn parse_auth_arg(value: &str) -> Result<String, String> {
+    parse_auth(value).map(|_| value.to_owned())
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn open_in_browser(url: &str) -> io::Result<()> {
+    command_status(ProcessCommand::new("cmd").args(["/C", "start", "", url]))
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn open_in_browser(url: &str) -> io::Result<()> {
+    command_status(ProcessCommand::new("open").arg(url))
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+pub(crate) fn open_in_browser(url: &str) -> io::Result<()> {
+    command_status(ProcessCommand::new("xdg-open").arg(url))
+}
+
+#[cfg(not(any(unix, target_os = "windows")))]
+pub(crate) fn open_in_browser(_url: &str) -> io::Result<()> {
+    Err(io::Error::other(
+        "opening a browser is not supported on this platform",
+    ))
+}
+
+fn command_status(command: &mut ProcessCommand) -> io::Result<()> {
+    let status = command.status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!("command exited with {status}")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    use super::*;
+
+    #[test]
+    fn normalizes_base_url() {
+        assert_eq!(normalize_base_url("/").unwrap(), "/");
+        assert_eq!(normalize_base_url("prefix").unwrap(), "/prefix/");
+        assert_eq!(normalize_base_url("/prefix").unwrap(), "/prefix/");
+        assert_eq!(normalize_base_url("/prefix/").unwrap(), "/prefix/");
+    }
+
+    #[test]
+    fn resolves_root_relative_try_file() {
+        let root = make_temp_dir();
+        let nested = root.join("assets");
+        fs::create_dir_all(&nested).unwrap();
+        let file = nested.join("404.html");
+        fs::write(&file, "not found").unwrap();
+
+        let resolved = resolve_try_file_path(&root, Path::new("assets/404.html")).unwrap();
+        assert_eq!(resolved, fs::canonicalize(file).unwrap());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rejects_try_file_that_escapes_root() {
+        let root = make_temp_dir();
+        let outside = root.parent().unwrap().join("outside-file.txt");
+        fs::write(&outside, "outside").unwrap();
+
+        let err = resolve_try_file_path(&root, Path::new("../outside-file.txt")).unwrap_err();
+        assert_eq!(err, "Permission Denied");
+
+        fs::remove_file(outside).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn parses_upload_size_limit_with_suffixes() {
+        assert_eq!(parse_upload_size_limit("30K").unwrap(), 30 * 1024);
+        assert_eq!(parse_upload_size_limit("50m").unwrap(), 50 * 1024 * 1024);
+        assert_eq!(parse_upload_size_limit("1G").unwrap(), 1024 * 1024 * 1024);
+        assert_eq!(parse_upload_size_limit("42").unwrap(), 42);
+        assert_eq!(parse_upload_size_limit("2kb").unwrap(), 2 * 1024);
+    }
+
+    #[test]
+    fn rejects_invalid_upload_size_limit_suffix() {
+        let err = parse_upload_size_limit("1KiB").unwrap_err();
+        assert_eq!(
+            err,
+            "unsupported size suffix, use bytes or K/M/G/T suffixes with powers of 1024, for example 30K, 50M, 1G"
+        );
+    }
+
+    #[test]
+    fn browser_url_uses_localhost_for_https_local_bindings() {
+        let mut config = test_config(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        config.cert = Some(PathBuf::from("localhost.p12"));
+        assert_eq!(browser_url(&config), "https://localhost:8000");
+
+        config.ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        assert_eq!(browser_url(&config), "https://localhost:8000");
+
+        config.ip = IpAddr::V6(Ipv6Addr::LOCALHOST);
+        assert_eq!(browser_url(&config), "https://localhost:8000");
+    }
+
+    #[test]
+    fn browser_url_keeps_bind_address_when_not_local_https() {
+        let mut config = test_config(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)));
+        config.cert = Some(PathBuf::from("server.p12"));
+        assert_eq!(browser_url(&config), "https://192.168.1.10:8000");
+
+        config.cert = None;
+        assert_eq!(browser_url(&config), "http://192.168.1.10:8000");
+    }
+
+    #[test]
+    fn defaults_to_loopback_bind() {
+        let config = build_config(build_cli().get_matches_from(["ihost"])).unwrap();
+        assert_eq!(config.ip, IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!(config.port, 8000);
+    }
+
+    #[test]
+    fn host_flag_binds_all_interfaces() {
+        for flag in ["-H", "--host"] {
+            let matches = build_cli().get_matches_from(["ihost", flag]);
+            let config = build_config(matches).unwrap();
+            assert_eq!(config.ip, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        }
+    }
+
+    #[test]
+    fn host_flag_conflicts_with_ip() {
+        let result = build_cli().try_get_matches_from(["ihost", "-H", "--ip", "10.0.0.5"]);
+        assert_eq!(
+            result.unwrap_err().kind(),
+            clap::error::ErrorKind::ArgumentConflict
+        );
+    }
+
+    #[test]
+    fn loopback_bind_shows_local_url_and_expose_hint() {
+        let config = test_config(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!(
+            address_lines(&config, None),
+            "       Local: http://127.0.0.1:8000\n     Network: use -H to expose"
+        );
+    }
+
+    #[test]
+    fn wildcard_bind_shows_local_and_network_urls() {
+        let config = test_config(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        let lan = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 23));
+        assert_eq!(
+            address_lines(&config, Some(lan)),
+            "       Local: http://127.0.0.1:8000\n     Network: http://192.168.1.23:8000"
+        );
+        assert_eq!(
+            address_lines(&config, None),
+            "       Local: http://127.0.0.1:8000\n     Network: not detected"
+        );
+    }
+
+    #[test]
+    fn ipv6_wildcard_bind_uses_ipv6_urls() {
+        let config = test_config(IpAddr::V6(Ipv6Addr::UNSPECIFIED));
+        let lan = IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 7));
+        assert_eq!(local_url(&config).unwrap(), "http://[::1]:8000");
+        assert_eq!(
+            network_url(&config, Some(lan)).unwrap(),
+            "http://[fd00::7]:8000"
+        );
+    }
+
+    #[test]
+    fn specific_bind_shows_only_that_address() {
+        let config = test_config(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)));
+        assert_eq!(
+            address_lines(&config, None),
+            "     Network: http://10.0.0.5:8000"
+        );
+    }
+
+    #[test]
+    fn https_wildcard_bind_uses_localhost_and_https_network_url() {
+        let mut config = test_config(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        config.cert = Some(PathBuf::from("localhost.p12"));
+        let lan = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 23));
+        assert_eq!(
+            address_lines(&config, Some(lan)),
+            "       Local: https://localhost:8000\n     Network: https://192.168.1.23:8000"
+        );
+    }
+
+    #[test]
+    fn browser_url_opens_loopback_for_wildcard_http_bind() {
+        let config = test_config(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        assert_eq!(browser_url(&config), "http://127.0.0.1:8000");
+    }
+
+    #[test]
+    fn network_ip_detection_skips_non_wildcard_binds() {
+        assert_eq!(detect_network_ip(IpAddr::V4(Ipv4Addr::LOCALHOST)), None);
+        assert_eq!(
+            detect_network_ip(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5))),
+            None
+        );
+    }
+
+    fn make_temp_dir() -> PathBuf {
+        let mut path = env::temp_dir();
+        path.push(format!(
+            "ihost-test-{}-{}",
+            std::process::id(),
+            generate_csrf_token().unwrap()
+        ));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn test_config(ip: IpAddr) -> Config {
+        Config {
+            root: PathBuf::from("."),
+            index: false,
+            upload: None,
+            redirect_to: None,
+            sort: true,
+            cache: true,
+            range: true,
+            cert: None,
+            certpass: None,
+            cors: false,
+            coop: false,
+            coep: false,
+            ip,
+            port: 8000,
+            upload_size_limit: 8 * 1024 * 1024,
+            auth: None,
+            compress: Vec::new(),
+            threads: 1,
+            try_file_404: None,
+            silent: false,
+            open: false,
+            base_url: "/".to_owned(),
+        }
+    }
+}
