@@ -7,11 +7,18 @@ ihost -H ~/Photos
 ```
 
 ```
-       Local: http://127.0.0.1:8000
-     Network: http://192.168.1.23:8000
+  iHost v0.8.1 · powered by Khaled Ghallab
+
+  Folder    /home/me/Photos
+  Local     http://127.0.0.1:8000
+  Network   http://192.168.1.23:8000
+
+  (QR code)
+
+  Started 2026-11-26 00:01:06 · press Ctrl+C to stop
 ```
 
-A QR code for the **Network** link is printed right below it: scan it with your phone's camera to browse and download the files.
+Scan the QR code with your phone's camera to open the **Network** link, then browse and download the files. Settings you change from their defaults (upload, password, HTTPS, …) are listed below the QR code.
 
 ## What it does
 
