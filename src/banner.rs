@@ -44,7 +44,7 @@ fn render(
 
     line(String::new());
     line(format!(
-        "{INDENT}{BOLD}iHost{RESET} {DIM}v{} · powered by Khaled Ghallab{RESET}",
+        "{INDENT}{BOLD}iHost{RESET} {DIM}v{} · Powered by Khaled Ghallab{RESET}",
         env!("CARGO_PKG_VERSION")
     ));
     line(String::new());
@@ -217,7 +217,7 @@ mod tests {
         assert_eq!(
             banner,
             format!(
-                "\n  iHost v{version} · powered by Khaled Ghallab\n\n  \
+                "\n  iHost v{version} · Powered by Khaled Ghallab\n\n  \
                  Folder    .\n  \
                  Local     http://127.0.0.1:8000\n  \
                  Network   add -H to share with your phone and other devices\n\n  \
@@ -233,7 +233,7 @@ mod tests {
         let banner = plain(&render(&config, None, false, "t"));
         let first = banner.lines().find(|line| !line.trim().is_empty()).unwrap();
         assert!(first.trim_start().starts_with("iHost v"));
-        assert!(first.ends_with("powered by Khaled Ghallab"));
+        assert!(first.ends_with("Powered by Khaled Ghallab"));
     }
 
     #[test]

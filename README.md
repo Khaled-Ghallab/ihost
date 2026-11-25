@@ -7,7 +7,7 @@ ihost -H ~/Photos
 ```
 
 ```
-  iHost v0.8.1 · powered by Khaled Ghallab
+  iHost v0.8.1 · Powered by Khaled Ghallab
 
   Folder    /home/me/Photos
   Local     http://127.0.0.1:8000
