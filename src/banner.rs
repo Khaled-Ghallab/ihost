@@ -75,17 +75,22 @@ fn render(
         }
     }
 
+    let mut settings = changed_settings(config);
+    // With --index the folder shows index.html, so point at the upload page.
+    // It leads the settings group, right above the "Upload" row it belongs to.
     if config.upload.is_some() && config.index {
         let base = network_url.clone().or_else(|| local_url(config));
         if let Some(base) = base {
-            line(row(
-                "Upload at",
-                &format!("{CYAN}{base}{}?{UPLOAD_PAGE_QUERY}{RESET}", config.base_url),
-            ));
+            settings.insert(
+                0,
+                (
+                    "Upload at",
+                    format!("{CYAN}{base}{}?{UPLOAD_PAGE_QUERY}{RESET}", config.base_url),
+                ),
+            );
         }
     }
 
-    let settings = changed_settings(config);
     if !settings.is_empty() {
         line(String::new());
         for (label, value) in settings {
@@ -320,6 +325,22 @@ mod tests {
             plain(&render(&config, lan(), false, "t"))
                 .contains("  Upload at http://192.168.1.23:8000/?upload\n")
         );
+
+        // Below the QR code there is a blank line, then the upload page link
+        // directly above the "Upload" settings row.
+        let with_qr = plain(&render(&config, lan(), true, "t"));
+        let lines: Vec<&str> = with_qr.lines().collect();
+        let at = lines
+            .iter()
+            .position(|line| line.starts_with("  Upload at "))
+            .unwrap();
+        assert_eq!(lines[at - 1], "");
+        assert!(
+            lines[at - 2].contains('▀')
+                || lines[at - 2].contains('▄')
+                || lines[at - 2].trim().is_empty()
+        );
+        assert!(lines[at + 1].starts_with("  Upload    on"));
 
         let mut local_only = config.clone();
         local_only.ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
