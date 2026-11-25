@@ -65,13 +65,13 @@ Network:
 
 Files:
   -i, --index            Show index.html / index.htm instead of the folder listing when present
-      --try-file <PATH>  Serve this file for missing paths, e.g. a single-page app's index.html. Relative paths are resolved against the served folder [aliases: --try-file-404]
+      --try-file <PATH>  Serve this file for missing paths, e.g. a single-page app's index.html. Relative paths are resolved against the served folder [alias: --try-file-404]
       --nosort           Disable sorting of folder listings (by name, modified, size)
   -b, --base-url <PATH>  URL prefix used in listings and upload redirects, for running behind a reverse proxy [default: /]
       --redirect <URL>   Redirect every request to this URL (HTTP 301)
 
 Uploads:
-  -u, --upload                    Allow uploading files from the browser (several at once, CSRF-protected)
+  -u, --upload                    Allow uploading files from the browser (several at once, CSRF-protected). With -i, upload from the /?upload page
   -l, --upload-size-limit <SIZE>  Maximum upload size, in bytes or with a K/M/G/T suffix (powers of 1024), e.g. 30K, 50M, 1G [default: 8M]
       --csrf <TOKEN>              Use a fixed CSRF token instead of a random one. Unsafe: the token shows up in process listings and shell history
 
@@ -124,6 +124,12 @@ Require a username and password:
 
 ```sh
 ihost -H -a me:secret .
+```
+
+Preview a built website and still accept uploads. With `-i` the folder shows its `index.html`, so the upload form lives on a separate page, `/?upload`, printed as **Upload at** on startup:
+
+```sh
+ihost -i -H -u dist
 ```
 
 Preview a built single-page app:

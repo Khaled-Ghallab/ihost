@@ -8,6 +8,7 @@ use std::{
 
 use crate::{
     config::{Config, DEFAULT_THREADS, detect_network_ip, local_url, network_url},
+    handlers::UPLOAD_PAGE_QUERY,
     qr,
     util::{human_size, now_string},
 };
@@ -74,7 +75,22 @@ fn render(
         }
     }
 
-    let settings = changed_settings(config);
+    let mut settings = changed_settings(config);
+    // With --index the folder shows index.html, so point at the upload page.
+    // It leads the settings group, right above the "Upload" row it belongs to.
+    if config.upload.is_some() && config.index {
+        let base = network_url.clone().or_else(|| local_url(config));
+        if let Some(base) = base {
+            settings.insert(
+                0,
+                (
+                    "Upload at",
+                    format!("{CYAN}{base}{}?{UPLOAD_PAGE_QUERY}{RESET}", config.base_url),
+                ),
+            );
+        }
+    }
+
     if !settings.is_empty() {
         line(String::new());
         for (label, value) in settings {
@@ -294,6 +310,41 @@ mod tests {
     fn strips_windows_verbatim_prefix_from_folder() {
         assert_eq!(display_path(r"\\?\D:\Photos"), r"D:\Photos");
         assert_eq!(display_path("/home/me/Photos"), "/home/me/Photos");
+    }
+
+    #[test]
+    fn upload_page_link_only_with_index_and_upload() {
+        let mut config = test_config(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        config.upload = Some(UploadConfig {
+            csrf_token: "t".to_owned(),
+        });
+        assert!(!plain(&render(&config, lan(), false, "t")).contains("Upload at"));
+
+        config.index = true;
+        assert!(
+            plain(&render(&config, lan(), false, "t"))
+                .contains("  Upload at http://192.168.1.23:8000/?upload\n")
+        );
+
+        // Below the QR code there is a blank line, then the upload page link
+        // directly above the "Upload" settings row.
+        let with_qr = plain(&render(&config, lan(), true, "t"));
+        let lines: Vec<&str> = with_qr.lines().collect();
+        let at = lines
+            .iter()
+            .position(|line| line.starts_with("  Upload at "))
+            .unwrap();
+        assert_eq!(lines[at - 1], "");
+        let qr_row = lines.iter().position(|line| line.contains('▀')).unwrap();
+        assert!(qr_row < at - 1);
+        assert!(lines[at + 1].starts_with("  Upload    on"));
+
+        let mut local_only = config.clone();
+        local_only.ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        assert!(
+            plain(&render(&local_only, None, false, "t"))
+                .contains("  Upload at http://127.0.0.1:8000/?upload\n")
+        );
     }
 
     #[test]
