@@ -11,7 +11,7 @@ ihost -H ~/Photos
      Network: http://192.168.1.23:8000
 ```
 
-Open the **Network** link on your phone to browse and download the files.
+A QR code for the **Network** link is printed right below it: scan it with your phone's camera to browse and download the files.
 
 ## What it does
 
@@ -50,7 +50,7 @@ Options:
   -V, --version  Print version
 
 Network:
-  -H, --host         Share with other devices on the network (binds 0.0.0.0 and prints the network URL)
+  -H, --host         Share with other devices on the network (binds 0.0.0.0, prints the network URL and a QR code)
   -p, --port <PORT>  Port to listen on [default: 8000]
       --ip <IP>      Bind to a specific IP address instead [default: 127.0.0.1]
 
