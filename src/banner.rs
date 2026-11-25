@@ -335,11 +335,8 @@ mod tests {
             .position(|line| line.starts_with("  Upload at "))
             .unwrap();
         assert_eq!(lines[at - 1], "");
-        assert!(
-            lines[at - 2].contains('▀')
-                || lines[at - 2].contains('▄')
-                || lines[at - 2].trim().is_empty()
-        );
+        let qr_row = lines.iter().position(|line| line.contains('▀')).unwrap();
+        assert!(qr_row < at - 1);
         assert!(lines[at + 1].starts_with("  Upload    on"));
 
         let mut local_only = config.clone();
