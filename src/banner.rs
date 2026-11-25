@@ -8,6 +8,7 @@ use std::{
 
 use crate::{
     config::{Config, DEFAULT_THREADS, detect_network_ip, local_url, network_url},
+    handlers::UPLOAD_PAGE_QUERY,
     qr,
     util::{human_size, now_string},
 };
@@ -71,6 +72,16 @@ fn render(
         line(String::new());
         for qr_line in drawing.lines() {
             line(format!("{INDENT}{qr_line}"));
+        }
+    }
+
+    if config.upload.is_some() && config.index {
+        let base = network_url.clone().or_else(|| local_url(config));
+        if let Some(base) = base {
+            line(row(
+                "Upload at",
+                &format!("{CYAN}{base}{}?{UPLOAD_PAGE_QUERY}{RESET}", config.base_url),
+            ));
         }
     }
 
@@ -294,6 +305,28 @@ mod tests {
     fn strips_windows_verbatim_prefix_from_folder() {
         assert_eq!(display_path(r"\\?\D:\Photos"), r"D:\Photos");
         assert_eq!(display_path("/home/me/Photos"), "/home/me/Photos");
+    }
+
+    #[test]
+    fn upload_page_link_only_with_index_and_upload() {
+        let mut config = test_config(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        config.upload = Some(UploadConfig {
+            csrf_token: "t".to_owned(),
+        });
+        assert!(!plain(&render(&config, lan(), false, "t")).contains("Upload at"));
+
+        config.index = true;
+        assert!(
+            plain(&render(&config, lan(), false, "t"))
+                .contains("  Upload at http://192.168.1.23:8000/?upload\n")
+        );
+
+        let mut local_only = config.clone();
+        local_only.ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        assert!(
+            plain(&render(&local_only, None, false, "t"))
+                .contains("  Upload at http://127.0.0.1:8000/?upload\n")
+        );
     }
 
     #[test]

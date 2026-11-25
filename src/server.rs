@@ -507,6 +507,88 @@ mod tests {
     }
 
     #[test]
+    fn upload_page_shows_form_even_with_index() {
+        run_async_test(async {
+            let root = make_temp_dir();
+            fs::write(root.join("index.html"), "<h1>site</h1>").unwrap();
+            fs::create_dir(root.join("sub")).unwrap();
+            let token = "csrf-token".to_owned();
+            let mut config = test_config(root.clone());
+            config.index = true;
+            config.upload = Some(UploadConfig {
+                csrf_token: token.clone(),
+            });
+
+            let get = |uri: &str| {
+                send(
+                    test_app(config.clone()),
+                    Request::builder().uri(uri).body(Body::empty()).unwrap(),
+                )
+            };
+
+            // Plain URL: the site itself.
+            assert_eq!(response_text(get("/").await).await, "<h1>site</h1>");
+
+            // Upload page: listing with the form; links keep ?upload.
+            let page = response_text(get("/?upload").await).await;
+            assert!(page.contains("action=\"/?upload\" method=\"POST\""));
+            assert!(page.contains("href=\"/sub/?upload\""));
+            assert!(page.contains("&upload\">Name</a>"));
+            assert!(page.contains("index.html"));
+
+            // Uploading from the upload page returns to it.
+            let boundary = "X-BOUNDARY";
+            let body = build_upload_body(boundary, &token, "hello.txt", "uploaded body");
+            let response = send(
+                test_app(config.clone()),
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/?upload")
+                    .header(
+                        header::CONTENT_TYPE,
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::FOUND);
+            assert_eq!(
+                response.headers().get(header::LOCATION).unwrap(),
+                "/?upload"
+            );
+            assert_eq!(
+                fs::read_to_string(root.join("hello.txt")).unwrap(),
+                "uploaded body"
+            );
+
+            fs::remove_dir_all(root).unwrap();
+        });
+    }
+
+    #[test]
+    fn upload_page_query_is_ignored_without_upload() {
+        run_async_test(async {
+            let root = make_temp_dir();
+            fs::write(root.join("index.html"), "<h1>site</h1>").unwrap();
+            let mut config = test_config(root.clone());
+            config.index = true;
+
+            let response = send(
+                test_app(config),
+                Request::builder()
+                    .uri("/?upload")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(response_text(response).await, "<h1>site</h1>");
+
+            fs::remove_dir_all(root).unwrap();
+        });
+    }
+
+    #[test]
     fn rejects_invalid_multipart_boundary_as_bad_request() {
         run_async_test(async {
             let root = make_temp_dir();

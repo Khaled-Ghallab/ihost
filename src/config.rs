@@ -161,7 +161,7 @@ pub(crate) fn build_cli() -> Command {
                 .long("upload")
                 .action(ArgAction::SetTrue)
                 .help_heading(HEADING_UPLOADS)
-                .help("Allow uploading files from the browser (several at once, CSRF-protected)"),
+                .help("Allow uploading files from the browser (several at once, CSRF-protected). With -i, upload from the /?upload page"),
         )
         .arg(
             Arg::new("upload_size_limit")

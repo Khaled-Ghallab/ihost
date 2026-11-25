@@ -72,6 +72,20 @@ struct RequestMeta {
 struct DirectoryQuery {
     sort: Option<String>,
     order: Option<String>,
+    /// `?upload`: show the listing with the upload form even when `--index`
+    /// would serve the folder's index.html instead.
+    upload: Option<String>,
+}
+
+/// Query marker for the upload page; see `DirectoryQuery::upload`.
+pub(crate) const UPLOAD_PAGE_QUERY: &str = "upload";
+
+fn has_upload_page_query(uri: &axum::http::Uri) -> bool {
+    uri.query().is_some_and(|query| {
+        query
+            .split('&')
+            .any(|pair| pair.split('=').next() == Some(UPLOAD_PAGE_QUERY))
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -283,6 +297,7 @@ async fn handle_request_inner(config: Arc<Config>, req: Request) -> Result<Respo
 
     if config.upload.is_some() && request_meta.method == Method::POST {
         let request_path = req.uri().path().to_owned();
+        let from_upload_page = has_upload_page_query(req.uri());
         if !is_multipart_request(&request_meta.headers) {
             return Err(AppError::new(
                 StatusCode::BAD_REQUEST,
@@ -291,7 +306,11 @@ async fn handle_request_inner(config: Arc<Config>, req: Request) -> Result<Respo
         }
 
         save_files(config.as_ref(), req, &fs_path).await?;
-        let redirect_target = upload_redirect_target(&config.base_url, &request_path);
+        let mut redirect_target = upload_redirect_target(&config.base_url, &request_path);
+        if from_upload_page {
+            redirect_target.push('?');
+            redirect_target.push_str(UPLOAD_PAGE_QUERY);
+        }
         return Ok(redirect_response(StatusCode::FOUND, &redirect_target));
     }
 
@@ -629,6 +648,13 @@ async fn list_directory(
     path_prefix: &[String],
     head_only: bool,
 ) -> Result<Response, AppError> {
+    let upload_page = config.upload.is_some() && query.upload.is_some();
+    let (dir_suffix, sort_suffix) = if upload_page {
+        ("?upload", "&upload")
+    } else {
+        ("", "")
+    };
+
     let mut entries = Vec::new();
     let read_dir = fs::read_dir(fs_path).map_err(AppError::from_io)?;
     for entry_result in read_dir {
@@ -647,17 +673,17 @@ async fn list_directory(
             let mut link_prefix = remaining.clone();
             link_prefix.push(label.clone());
             links.push(format!(
-                "<a href=\"{}{}\"><strong>{}</strong></a>",
+                "<a href=\"{}{}{dir_suffix}\"><strong>{}</strong></a>",
                 config.base_url,
                 encode_link_path(&link_prefix),
                 escape_html(&label)
             ));
         }
-        links.push(root_link(&config.base_url));
+        links.push(root_link(&format!("{}{dir_suffix}", config.base_url)));
         links.reverse();
         links.join(" / ")
     } else {
-        root_link(&config.base_url)
+        root_link(&format!("{}{dir_suffix}", config.base_url))
     };
 
     let sort_links = if config.sort {
@@ -722,7 +748,7 @@ async fn list_directory(
         current_link.push(String::new());
 
         format!(
-            "\n<tr>\n  <th><a href=\"{}{}?sort=name&order={}\">Name</a></th>\n  <th><a href=\"{}{}?sort=modified&order={}\">Last modified</a></th>\n  <th><a href=\"{}{}?sort=size&order={}\">Size</a></th>\n</tr>\n<tr><td style=\"border-top:1px dashed #BBB;\" colspan=\"5\"></td></tr>\n",
+            "\n<tr>\n  <th><a href=\"{}{}?sort=name&order={}{sort_suffix}\">Name</a></th>\n  <th><a href=\"{}{}?sort=modified&order={}{sort_suffix}\">Last modified</a></th>\n  <th><a href=\"{}{}?sort=size&order={}{sort_suffix}\">Size</a></th>\n</tr>\n<tr><td style=\"border-top:1px dashed #BBB;\" colspan=\"5\"></td></tr>\n",
             config.base_url,
             encode_link_path(&current_link),
             next_orders.get("name").copied().unwrap_or(DEFAULT_ORDER),
@@ -749,7 +775,7 @@ async fn list_directory(
             link.push(String::new());
         }
         rows.push(format!(
-            "\n<tr>\n  <td><a href=\"{}{}\"><strong>[Up]</strong></a></td>\n  <td></td>\n  <td></td>\n</tr>\n",
+            "\n<tr>\n  <td><a href=\"{}{}{dir_suffix}\"><strong>[Up]</strong></a></td>\n  <td></td>\n  <td></td>\n</tr>\n",
             config.base_url,
             encode_link_path(&link),
         ));
@@ -758,7 +784,10 @@ async fn list_directory(
     }
 
     for entry in entries {
-        if config.index && (entry.filename == "index.html" || entry.filename == "index.htm") {
+        if config.index
+            && !upload_page
+            && (entry.filename == "index.html" || entry.filename == "index.htm")
+        {
             return send_file(
                 config,
                 request,
@@ -782,7 +811,7 @@ async fn list_directory(
         };
 
         rows.push(format!(
-            "\n<tr>\n  <td><a {} href=\"{}{}\">{}</a></td>\n  <td style=\"color:#888;\">[{}]</td>\n  <td><bold>{}</bold></td>\n</tr>\n",
+            "\n<tr>\n  <td><a {} href=\"{}{}{}\">{}</a></td>\n  <td style=\"color:#888;\">[{}]</td>\n  <td><bold>{}</bold></td>\n</tr>\n",
             if entry.metadata.is_dir() {
                 "style=\"font-weight: bold;\""
             } else {
@@ -790,6 +819,11 @@ async fn list_directory(
             },
             config.base_url,
             encode_link_path(&link),
+            if entry.metadata.is_dir() {
+                dir_suffix
+            } else {
+                ""
+            },
             escape_html(&label),
             format_local_time(entry.metadata.modified().unwrap_or(UNIX_EPOCH)),
             if entry.metadata.is_dir() {
@@ -805,7 +839,7 @@ async fn list_directory(
         .as_ref()
         .map(|upload| {
             format!(
-                "\n<form style=\"margin-top:1em; margin-bottom:1em;\" action=\"{}{}\" method=\"POST\" enctype=\"multipart/form-data\">\n  <input type=\"file\" name=\"files\" accept=\"*\" multiple />\n  <input type=\"hidden\" name=\"csrf\" value=\"{}\"/>\n  <input type=\"submit\" value=\"Upload\" />\n</form>\n",
+                "\n<form style=\"margin-top:1em; margin-bottom:1em;\" action=\"{}{}{dir_suffix}\" method=\"POST\" enctype=\"multipart/form-data\">\n  <input type=\"file\" name=\"files\" accept=\"*\" multiple />\n  <input type=\"hidden\" name=\"csrf\" value=\"{}\"/>\n  <input type=\"submit\" value=\"Upload\" />\n</form>\n",
                 config.base_url,
                 encode_link_path(path_prefix),
                 escape_html(&upload.csrf_token),
